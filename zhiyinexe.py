@@ -2,131 +2,160 @@ import sys
 import asyncio
 import threading
 import websockets
-from PySide6.QtWidgets import QApplication, QMainWindow, QPushButton, QVBoxLayout, QWidget, QLabel, QLineEdit, QTextEdit
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+import time
+import json
+from PyQt5.QtWidgets import QApplication, QWidget, QVBoxLayout, QPushButton, QTextEdit, QListWidget
+from PyQt5.QtCore import QObject, pyqtSignal,pyqtSlot
+from DrissionPage import ChromiumPage
 
-class WebSocketThread(threading.Thread):
-    def __init__(self, window):
-        super().__init__()
-        self.window = window
-        self.websocket = None
-        self.connected_devices = set()
-        self.messages = []
-        self.is_running = False
 
-    async def handle_client(self, websocket, path):
-        self.websocket = websocket
-        self.connected_devices.add(websocket.remote_address)
-        self.update_device_list()
-        self.is_running = True
-        async for message in websocket:
-            print(f"Received message: {message}")
-            self.messages.append(message)
-            self.window.update_messages()
 
-    def run(self):
-        asyncio.set_event_loop(asyncio.new_event_loop())
-        start_server = websockets.serve(self.handle_client, "localhost", 8765)
-        asyncio.get_event_loop().run_until_complete(start_server)
-        self.is_running = True
-        asyncio.get_event_loop().run_forever()
+class WebSocketServer(QObject):
+    client_connected = pyqtSignal(str)
+    client_disconnected = pyqtSignal(str)
+    message_received = pyqtSignal(str)
 
-    async def send_message(self, message):
-        if self.websocket:
-            await self.websocket.send(message)
-
-    def update_device_list(self):
-        self.window.update_device_list(list(self.connected_devices))
-
-class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+        self.clients = set()
+        self.server = None
+        self.thread = threading.Thread(target=self.start_server)
+        self.running = threading.Event()
 
-        self.setWindowTitle("WebSocket 示例")
-        self.setGeometry(100, 100, 400, 500)
+    def start_server(self):
+        asyncio.set_event_loop(asyncio.new_event_loop())
+        self.server = websockets.serve(self.handle_client, "0.0.0.0", 8765)
+        asyncio.get_event_loop().run_until_complete(self.server)
+        asyncio.get_event_loop().run_forever()
 
+    async def handle_client(self, websocket, path):
+        self.clients.add(websocket)
+        self.client_connected.emit(str(websocket.remote_address))
+
+        await websocket.send("""{"content":"已连接","nickName":"websocket服务"}""")
+
+
+        try:
+            async for message in websocket:
+                self.message_received.emit(message)
+        except websockets.exceptions.ConnectionClosed:
+            pass
+        finally:
+            self.clients.remove(websocket)
+            self.client_disconnected.emit(str(websocket.remote_address))
+
+    def stop_server(self):
+        if self.server:
+            self.server.ws_server.close()
+            self.thread.quit()
+            self.running.clear()
+
+
+
+    def send_message(self, message):
+        for client in self.clients:
+            asyncio.run(client.send(message))
+
+
+class ContentFetcher(QObject):
+    contentReceived = pyqtSignal(str)
+
+    def __init__(self, interval=5):
+        super().__init__()
+        self._running = threading.Event()
+        self._running.set()
+        self.interval = interval
+        # 创建页面对象，并启动或接管浏览器
+        self.page = ChromiumPage()
+        # 跳转到登录页面
+        self.page.get('https://channels.weixin.qq.com/platform/login')
+
+    def run(self):
+        while self._running.is_set():
+            # 在这里执行定时任务，获取连接地址中的特定内容
+            content = "Special content from server"
+            self.contentReceived.emit(content)
+            time.sleep(self.interval)
+
+    def pauseLoop(self):
+        self._running.clear()
+
+    def resumeLoop(self):
+        self._running.set()
+
+    def setInterval(self, interval):
+        self.interval = interval
+
+             
+
+class MainWindow(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("WebSocket Server")
+        self.init_ui()
+
+    def init_ui(self):
         layout = QVBoxLayout()
-        widget = QWidget()
-        widget.setLayout(layout)
-        self.setCentralWidget(widget)
 
-        self.start_button = QPushButton("启动 WebSocket 服务器")
+        self.start_button = QPushButton("Start Server")
         self.start_button.clicked.connect(self.start_server)
         layout.addWidget(self.start_button)
 
-        self.server_status_label = QLabel("WebSocket 服务器状态: 未启动")
-        layout.addWidget(self.server_status_label)
+        self.stop_button = QPushButton("Stop Server")
+        self.stop_button.clicked.connect(self.stop_server)
+        self.stop_button.setEnabled(False)
+        layout.addWidget(self.stop_button)
 
-        self.device_label = QLabel("连接设备: ")
-        layout.addWidget(self.device_label)
+        self.message_edit = QTextEdit()
+        layout.addWidget(self.message_edit)
 
-        self.messages_label = QLabel("接收到的消息:")
-        layout.addWidget(self.messages_label)
-
-        self.messages_text = QTextEdit()
-        layout.addWidget(self.messages_text)
-
-        self.message_input = QLineEdit()
-        layout.addWidget(self.message_input)
-
-        self.send_button = QPushButton("发送消息")
+        self.send_button = QPushButton("Send Message")
         self.send_button.clicked.connect(self.send_message)
         layout.addWidget(self.send_button)
 
-        self.interval_label = QLabel("定时间隔（秒）:")
-        layout.addWidget(self.interval_label)
+        self.client_list = QListWidget()
+        layout.addWidget(self.client_list)
 
-        self.interval_input = QLineEdit()
-        layout.addWidget(self.interval_input)
+        self.message_list = QListWidget()
+        layout.addWidget(self.message_list)
 
-        self.start_timer_button = QPushButton("开启定时任务")
-        self.start_timer_button.clicked.connect(self.start_timer)
-        layout.addWidget(self.start_timer_button)
+        self.setLayout(layout)
 
-        self.websocket_thread = None
-        self.scheduler = AsyncIOScheduler()
-        self.scheduler.start()
+        self.websocket_server = WebSocketServer()
+        self.websocket_server.client_connected.connect(self.update_client_list)
+        self.websocket_server.client_disconnected.connect(self.update_client_list)
+        self.websocket_server.message_received.connect(self.update_message_list)
 
     def start_server(self):
-        self.websocket_thread = WebSocketThread(self)
-        self.websocket_thread.start()
-        self.server_status_label.setText("WebSocket 服务器状态: 运行中")
+        self.websocket_server.running.set()
+        self.websocket_server.thread.start()
+        self.start_button.setEnabled(False)
+        self.stop_button.setEnabled(True)
+
+    def stop_server(self):
+        self.websocket_server.stop_server()
+        self.start_button.setEnabled(True)
+        self.stop_button.setEnabled(False)
 
     def send_message(self):
-        message = self.message_input.text()
-        if message and self.websocket_thread:
-            asyncio.run(self.websocket_thread.send_message(message))
-            self.message_input.clear()
+        content = self.message_edit.toPlainText()
+        message = f"""{{"content":"{content}","nickName":"websocket服务"}}"""       
+        if message:
+            self.websocket_server.send_message(message)
 
-    def update_messages(self):
-        messages = "\n".join(self.websocket_thread.messages)
-        self.messages_text.setPlainText(messages)
+    def update_client_list(self, address):
+        if self.websocket_server.running.is_set():
+            self.client_list.clear()
+            for client in self.websocket_server.clients:
+                self.client_list.addItem(str(client.remote_address))
 
-    def update_device_list(self, devices):
-        device_text = ", ".join(str(device) for device in devices)
-        self.device_label.setText(f"连接设备: {device_text}")
+    def update_message_list(self, message):
+        if self.websocket_server.running.is_set():
+            self.message_list.addItem(message)
 
-    def start_timer(self):
-        interval_str = self.interval_input.text()
-        if interval_str and self.websocket_thread:
-            interval = float(interval_str)
-            if not self.scheduler.get_job("send_message"):
-                self.scheduler.add_job(self.send_periodic_message, "interval", seconds=interval, id="send_message")
-                self.start_timer_button.setText("取消定时任务")
-            else:
-                self.scheduler.remove_job("send_message")
-                self.start_timer_button.setText("开启定时任务")
 
-    async def send_periodic_message(self):
-        message = "定时任务：发送消息"
-        if self.websocket_thread:
-            await self.websocket_thread.send_message(message)
-
-def main():
+if __name__ == "__main__":
     app = QApplication(sys.argv)
     window = MainWindow()
     window.show()
-    sys.exit(app.exec())
-
-if __name__ == "__main__":
-    main()
+    sys.exit(app.exec_())
